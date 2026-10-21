@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,6 +72,41 @@ func TestRuntimeEventsKeepUnknownAttemptsAndDeletedDoesNotProveExit(testContext 
 			testContext.Fatalf("raw event was dropped or promoted to exit: %+v", facts)
 		}
 	}
+}
+
+func TestRuntimeSandboxDeletedEventDoesNotInventContainerAttempt(testContext *testing.T) {
+	uid := "481c72aa-da10-4544-ba08-29f090cf6e4d"
+	sandbox, container := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	event := &cri.ContainerEventResponse{ContainerId: sandbox, ContainerEventType: cri.ContainerEventType_CONTAINER_DELETED_EVENT, CreatedAt: time.Now().UnixNano(), PodSandboxStatus: &cri.PodSandboxStatus{Id: sandbox, Metadata: &cri.PodSandboxMetadata{Uid: uid, Namespace: "tenant", Name: "workspace"}}, ContainersStatuses: []*cri.ContainerStatus{{Id: container, Metadata: &cri.ContainerMetadata{Name: "workspace"}, Labels: map[string]string{"io.kubernetes.pod.uid": uid, "io.kubernetes.pod.namespace": "tenant", "io.kubernetes.pod.name": "workspace"}, State: cri.ContainerState_CONTAINER_EXITED, FinishedAt: time.Now().Add(-time.Second).UnixNano()}}}
+	facts := ExtractEvent(event, time.Now())
+	if len(facts) != 1 || facts[0].ContainerId != container || facts[0].SandboxId != sandbox || facts[0].State != nodev1.ContainerState_CONTAINER_STATE_EXITED || facts[0].FinishedAt == nil || facts[0].EventType != nil {
+		testContext.Fatalf("bound sandbox lifecycle was converted to an unexplained container: %+v", facts)
+	}
+	event.ContainersStatuses = nil
+	if facts = ExtractEvent(event, time.Now()); len(facts) != 0 {
+		testContext.Fatal("sandbox-only deletion fabricated a container or exit")
+	}
+	event.PodSandboxStatus.Metadata.Uid = ""
+	if facts = ExtractEvent(event, time.Now()); len(facts) != 1 || facts[0].ContainerId != sandbox || facts[0].State != nodev1.ContainerState_CONTAINER_STATE_UNKNOWN || facts[0].FinishedAt != nil {
+		testContext.Fatal("unbound sandbox-looking identity was silently ignored")
+	}
+}
+
+func TestRuntimeUnknownEventTypeCannotBecomeUnsupportedWireEnum(testContext *testing.T) {
+	event := &cri.ContainerEventResponse{ContainerId: strings.Repeat("a", 64), ContainerEventType: cri.ContainerEventType(4), CreatedAt: time.Now().UnixNano()}
+	facts := ExtractEvent(event, time.Now())
+	if len(facts) != 1 || facts[0].State != nodev1.ContainerState_CONTAINER_STATE_UNKNOWN || facts[0].EventType != nil || !containsIssue(facts[0].Issues, "CRI_EVENT_TYPE_UNKNOWN") {
+		testContext.Fatalf("unknown raw event was dropped or encoded as an unsupported enum: %+v", facts)
+	}
+}
+
+func containsIssue(issues []string, wanted string) bool {
+	for _, issue := range issues {
+		if issue == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func TestPodResourcesKeepsOnlyReportedIdentity(testContext *testing.T) {
