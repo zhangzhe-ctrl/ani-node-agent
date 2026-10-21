@@ -15,6 +15,76 @@ func recordBuilder(content string) func(string, uint64) ([]byte, string, error) 
 	}
 }
 
+func TestPendingPayloadRemainsOnDiskAcrossRestart(testContext *testing.T) {
+	directory := testContext.TempDir()
+	log, err := Open(directory, "node-a", Options{})
+	if err != nil {
+		testContext.Fatal(err)
+	}
+	content := strings.Repeat("durable backlog ", 16384)
+	for count := 0; count < 24; count++ {
+		if _, err = log.Enqueue(recordBuilder(content)); err != nil {
+			testContext.Fatal(err)
+		}
+	}
+	assertDiskOnlyPending := func() {
+		testContext.Helper()
+		for _, pending := range log.pending {
+			if len(pending.Bytes) != 0 {
+				testContext.Fatal("durable backlog payload retained in memory")
+			}
+		}
+	}
+	assertDiskOnlyPending()
+	logID := log.LogID()
+	if err = log.Close(); err != nil {
+		testContext.Fatal(err)
+	}
+	log, err = Open(directory, "node-a", Options{})
+	if err != nil {
+		testContext.Fatal(err)
+	}
+	defer log.Close()
+	assertDiskOnlyPending()
+	if log.LogID() != logID {
+		testContext.Fatal("disk-backed restart changed log identity")
+	}
+	for sequence := uint64(1); sequence <= 24; sequence++ {
+		record, ok, nextErr := log.Next()
+		if nextErr != nil || !ok || record.Sequence != sequence || string(record.Bytes) != content {
+			testContext.Fatalf("disk replay failed at sequence %d: %v", sequence, nextErr)
+		}
+		if err = log.Acknowledge(logID, Receipt{Sequence: sequence, Digest: record.Digest}); err != nil {
+			testContext.Fatal(err)
+		}
+		assertDiskOnlyPending()
+	}
+	if log.bytes != 0 {
+		testContext.Fatal("durable encoded-byte accounting did not reach zero")
+	}
+}
+
+func TestNextRejectsDurableFileChangedAfterOpen(testContext *testing.T) {
+	directory := testContext.TempDir()
+	log, err := Open(directory, "node-a", Options{})
+	if err != nil {
+		testContext.Fatal(err)
+	}
+	defer log.Close()
+	if _, err = log.Enqueue(recordBuilder("original immutable bytes")); err != nil {
+		testContext.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(directory, recordName(1)), []byte("corrupt after open"), 0600); err != nil {
+		testContext.Fatal(err)
+	}
+	if _, _, err = log.Next(); !errors.Is(err, ErrCorrupt) {
+		testContext.Fatalf("changed durable record was sent: %v", err)
+	}
+	if log.Watermark().Sequence != 0 {
+		testContext.Fatal("corrupt record advanced receipt")
+	}
+}
+
 func TestDurableReplaySingleFlightAndAckLoss(testContext *testing.T) {
 	directory := testContext.TempDir()
 	log, err := Open(directory, "node-a", Options{})
