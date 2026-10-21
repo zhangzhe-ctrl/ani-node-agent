@@ -20,6 +20,13 @@ type CollectionConfig struct {
 }
 
 func (client *Client) Collect(ctx context.Context, config CollectionConfig) error {
+	for client.Log.NodeUID() == "" || client.Epoch.Load() == 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 	events := make(chan gpu.Event, 256)
 	go func() {
 		_ = gpu.WatchEvents(ctx, config.CRISocket, func(event gpu.Event) error {
