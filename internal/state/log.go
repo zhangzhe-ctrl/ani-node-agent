@@ -46,10 +46,11 @@ type Receipt struct {
 }
 
 type Record struct {
-	Sequence uint64 `json:"sequence"`
-	Digest   string `json:"digest"`
-	Checksum string `json:"checksum"`
-	Bytes    []byte `json:"bytes"`
+	Sequence     uint64 `json:"sequence"`
+	Digest       string `json:"digest"`
+	Checksum     string `json:"checksum"`
+	Bytes        []byte `json:"bytes"`
+	encodedBytes int64
 }
 
 type Log struct {
@@ -171,18 +172,9 @@ func Open(directory, nodeUID string, options Options) (*Log, error) {
 		if entry.Type()&os.ModeSymlink != 0 || entry.IsDir() {
 			return nil, ErrCorrupt
 		}
-		file, openErr := os.Open(filepath.Join(directory, entry.Name()))
-		if openErr != nil {
-			return nil, openErr
-		}
-		data, readErr := io.ReadAll(io.LimitReader(file, int64(options.MaxRecordBytes)*2+4096))
-		file.Close()
+		record, readErr := log.readRecord(entry.Name())
 		if readErr != nil {
 			return nil, readErr
-		}
-		var record Record
-		if json.Unmarshal(data, &record) != nil || record.Sequence == 0 || record.Digest == "" || len(record.Bytes) > options.MaxRecordBytes || record.Checksum != checksum(record.Bytes) || entry.Name() != recordName(record.Sequence) {
-			return nil, ErrCorrupt
 		}
 		if record.Sequence <= log.ack.Sequence {
 			continue
@@ -190,8 +182,9 @@ func Open(directory, nodeUID string, options Options) (*Log, error) {
 		if record.Sequence != log.ack.Sequence+uint64(len(log.pending))+1 {
 			return nil, ErrCorrupt
 		}
+		log.bytes += record.encodedBytes
+		record.Bytes = nil
 		log.pending = append(log.pending, record)
-		log.bytes += int64(len(data))
 	}
 	if err = log.reclaim(); err != nil {
 		return nil, err
@@ -287,7 +280,10 @@ func (log *Log) enqueue(build func(string, uint64) ([]byte, string, error), reco
 		_ = log.fault("LOCAL_EVENT_STORE_WRITE_FAILED")
 		return Record{}, err
 	}
-	log.pending = append(log.pending, record)
+	index := record
+	index.Bytes = nil
+	index.encodedBytes = int64(len(data))
+	log.pending = append(log.pending, index)
 	log.bytes += int64(len(data))
 	if recovery {
 		if err = log.reserve(); err != nil {
@@ -317,8 +313,44 @@ func (log *Log) Next() (Record, bool, error) {
 	if len(log.pending) == 0 {
 		return Record{}, false, nil
 	}
+	index := log.pending[0]
+	record, err := log.readRecord(recordName(index.Sequence))
+	if err != nil || record.Sequence != index.Sequence || record.Digest != index.Digest || record.Checksum != index.Checksum || record.encodedBytes != index.encodedBytes {
+		log.degraded = true
+		_ = log.fault("LOCAL_EVENT_STORE_READ_FAILED")
+		if err == nil {
+			err = ErrCorrupt
+		}
+		return Record{}, false, err
+	}
 	log.inFlight = true
-	return clone(log.pending[0]), true, nil
+	return record, true, nil
+}
+
+func (log *Log) readRecord(name string) (Record, error) {
+	var record Record
+	path := filepath.Join(log.directory, name)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return record, err
+	}
+	if !info.Mode().IsRegular() {
+		return record, ErrCorrupt
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return record, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, int64(log.options.MaxRecordBytes)*2+4096))
+	if err != nil {
+		return record, err
+	}
+	if json.Unmarshal(data, &record) != nil || record.Sequence == 0 || record.Digest == "" || len(record.Bytes) == 0 || len(record.Bytes) > log.options.MaxRecordBytes || record.Checksum != checksum(record.Bytes) || name != recordName(record.Sequence) {
+		return Record{}, ErrCorrupt
+	}
+	record.encodedBytes = int64(len(data))
+	return record, nil
 }
 
 func (log *Log) Reconnect() { log.mu.Lock(); defer log.mu.Unlock(); log.inFlight = false }
@@ -363,9 +395,9 @@ func (log *Log) acknowledge(receipt Receipt) error {
 		_ = log.fault("ACK_SYNC_FAILED")
 		return err
 	}
-	data, _ := json.Marshal(log.pending[0])
-	log.bytes -= int64(len(data))
+	log.bytes -= log.pending[0].encodedBytes
 	log.ack = receipt
+	log.pending[0] = Record{}
 	log.pending = log.pending[1:]
 	log.inFlight = false
 	if err := log.reclaim(); err != nil {
