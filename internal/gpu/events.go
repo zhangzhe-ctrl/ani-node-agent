@@ -2,6 +2,7 @@ package gpu
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	nodev1 "github.com/zhangzhe-ctrl/ani-accelerator-service/api/gen/go/accelerator/node/v1"
@@ -20,6 +21,8 @@ func ExtractEvent(event *cri.ContainerEventResponse, observed time.Time) []*node
 	}
 	var result []*nodev1.RuntimeFact
 	seen := false
+	knownType := knownRuntimeEventType(event.ContainerEventType)
+	sandboxEvent := knownType && boundSandboxEvent(event)
 	for _, status := range event.ContainersStatuses {
 		if status == nil {
 			continue
@@ -37,14 +40,23 @@ func ExtractEvent(event *cri.ContainerEventResponse, observed time.Time) []*node
 		}
 		if status.Id == event.ContainerId {
 			seen = true
-			kind := nodev1.RuntimeEventType(event.ContainerEventType + 1)
-			fact.EventType = &kind
+			if knownType {
+				kind := nodev1.RuntimeEventType(event.ContainerEventType + 1)
+				fact.EventType = &kind
+			}
+			if sandboxEvent {
+				fact.State = nodev1.ContainerState_CONTAINER_STATE_UNKNOWN
+				fact.Issues = append(fact.Issues, "CRI_EVENT_CONTAINER_SANDBOX_IDENTITY_CONFLICT")
+			}
 		}
 		result = append(result, fact)
 	}
-	if !seen {
-		kind := nodev1.RuntimeEventType(event.ContainerEventType + 1)
-		fact := &nodev1.RuntimeFact{ContainerId: event.ContainerId, State: nodev1.ContainerState_CONTAINER_STATE_UNKNOWN, ObservedAt: timestamppb.New(observed), EventType: &kind, Issues: []string{"CRI_EVENT_STATUS_UNAVAILABLE"}}
+	if !seen && !sandboxEvent {
+		fact := &nodev1.RuntimeFact{ContainerId: event.ContainerId, State: nodev1.ContainerState_CONTAINER_STATE_UNKNOWN, ObservedAt: timestamppb.New(observed), Issues: []string{"CRI_EVENT_STATUS_UNAVAILABLE"}}
+		if knownType {
+			kind := nodev1.RuntimeEventType(event.ContainerEventType + 1)
+			fact.EventType = &kind
+		}
 		if event.CreatedAt > 0 {
 			fact.ObservedAt = timestamppb.New(time.Unix(0, event.CreatedAt))
 		}
@@ -58,7 +70,26 @@ func ExtractEvent(event *cri.ContainerEventResponse, observed time.Time) []*node
 		}
 		result = append(result, fact)
 	}
+	if !knownType {
+		for _, fact := range result {
+			fact.State = nodev1.ContainerState_CONTAINER_STATE_UNKNOWN
+			fact.Issues = append(fact.Issues, "CRI_EVENT_TYPE_UNKNOWN")
+		}
+	}
 	return result
+}
+
+func knownRuntimeEventType(kind cri.ContainerEventType) bool {
+	return kind >= cri.ContainerEventType_CONTAINER_CREATED_EVENT && kind <= cri.ContainerEventType_CONTAINER_DELETED_EVENT
+}
+
+func boundSandboxEvent(event *cri.ContainerEventResponse) bool {
+	sandbox := event.PodSandboxStatus
+	if sandbox == nil || sandbox.Metadata == nil || len(sandbox.Id) != 64 || strings.Trim(sandbox.Id, "0123456789abcdef") != "" || event.ContainerId != sandbox.Id {
+		return false
+	}
+	pod := sandbox.Metadata
+	return journalUID.MatchString(pod.Uid) && len(pod.Namespace) <= 63 && !strings.Contains(pod.Namespace, ".") && journalName.MatchString(pod.Namespace) && journalName.MatchString(pod.Name)
 }
 
 func WatchEvents(ctx context.Context, socket string, emit func(Event) error) error {
@@ -81,6 +112,13 @@ func WatchEvents(ctx context.Context, socket string, emit func(Event) error) err
 					event, receiveErr := stream.Recv()
 					if receiveErr != nil {
 						break
+					}
+					if !knownRuntimeEventType(event.ContainerEventType) {
+						now := timestamppb.Now()
+						if err = emit(Event{Gap: &nodev1.SourceGap{Sources: []nodev1.Source{nodev1.Source_SOURCE_CRI_EVENTS}, Reason: "CRI_EVENT_TYPE_UNKNOWN", Start: now, End: now, DiscoveredAt: now}}); err != nil {
+							connection.Close()
+							return err
+						}
 					}
 					facts := ExtractEvent(event, time.Now().UTC())
 					valid := facts[:0]
