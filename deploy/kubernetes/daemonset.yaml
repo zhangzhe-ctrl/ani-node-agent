@@ -106,7 +106,8 @@ spec:
             - name: state
               mountPath: /var/lib/ani-node-agent
             - name: cri
-              mountPath: /run/containerd/containerd.sock
+              # Keep replacement sockets visible after containerd restarts.
+              mountPath: /run/containerd
               readOnly: true
             - name: pod-resources
               mountPath: /var/lib/kubelet/pod-resources
@@ -136,8 +137,8 @@ spec:
             type: DirectoryOrCreate
         - name: cri
           hostPath:
-            path: /run/containerd/containerd.sock
-            type: Socket
+            path: /run/containerd
+            type: Directory
         - name: pod-resources
           hostPath:
             path: /var/lib/kubelet/pod-resources
